@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Q9 — API reliability test</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        padding: 2rem;
+        background: #f5f6f8;
+      }
+      pre {
+        background: #1a1a1a;
+        color: #eaeaea;
+        padding: 1rem;
+        border-radius: 6px;
+        overflow-x: auto;
+      }
+      h1 {
+        font-size: 1.25rem;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Q9 — API reliability tests</h1>
+    <pre id="output">Running...</pre>
+
+    <script>
+      // ---------- Mock newsletter service ----------
+      const mockStore = new Map(); // idempotencyKey -> email
+
+      async function mockNewsletterService(
+        { email, idempotency_key },
+        attempt,
+      ) {
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+          return { status: 400, body: { error: "invalid_email" } };
+        }
+        if (attempt === 1 && email.startsWith("ratelimit")) {
+          return { status: 429, headers: { "Retry-After": "1" } };
+        }
+        if (attempt === 1 && email.startsWith("timeout")) {
+          const err = new Error("Request timed out");
+          err.name = "TimeoutError";
+          throw err;
+        }
+        if (mockStore.has(idempotency_key)) {
+          return { status: 200, body: { status: "already_subscribed" } };
+        }
+        mockStore.set(idempotency_key, email);
+        return { status: 200, body: { status: "subscribed" } };
+      }
+
+      // ---------- Helpers ----------
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      function mask(email) {
+        const [user, domain] = email.split("@");
+        const visible = user.slice(0, 2);
+        return `${visible}${"*".repeat(Math.max(user.length - 2, 1))}@${domain}`;
+      }
+
+      // ---------- The subscribe function ----------
+      async function subscribe(email, idempotencyKey) {
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            const res = await mockNewsletterService(
+              { email, idempotency_key: idempotencyKey },
+              attempt,
+            );
+
+            if (res.status === 429) {
+              const retryAfter = parseInt(
+                res.headers?.["Retry-After"] || "2",
+                10,
+              );
+              log(`Rate limited. Waiting ${retryAfter}s.`);
+              await sleep(retryAfter * 1000);
+              continue;
+            }
+
+            if (res.status === 400) {
+              log(
+                JSON.stringify({
+                  event: "rejected",
+                  email_masked: mask(email),
+                  reason: res.body.error,
+                }),
+              );
+              return { status: "rejected", reason: res.body.error };
+            }
+
+            if (res.status === 200) {
+              return { status: "subscribed", note: res.body.status, email };
+            }
+
+            throw new Error(`Unexpected status ${res.status}`);
+          } catch (err) {
+            const isTimeout =
+              err.name === "TimeoutError" || err.name === "AbortError";
+            if (isTimeout && attempt < 3) {
+              log(`Attempt ${attempt} timed out. Retrying.`);
+              await sleep(500 * Math.pow(2, attempt));
+              continue;
+            }
+            log(
+              JSON.stringify({
+                event: "failed",
+                email_masked: mask(email),
+                attempt,
+                err: err.message,
+              }),
+            );
+            throw err;
+          }
+        }
+        return { status: "queued_for_retry" };
+      }
+
+      const output = document.getElementById("output");
+      let buffer = "";
+      function log(line) {
+        buffer += line + "\n";
+        output.textContent = buffer;
+      }
+
+      // ---------- Tests ----------
+      const randomKey = () => "key_" + Math.random().toString(36).slice(2, 10);
+
+      async function run() {
+        log("--- Test 1: happy path ---");
+        log(JSON.stringify(await subscribe("jubril@example.com", randomKey())));
+
+        log(
+          "\n--- Test 2: timeout then retry (service accepted, response lost) ---",
+        );
+        const key2 = randomKey();
+        log(JSON.stringify(await subscribe("timeout.user@example.com", key2)));
+        const dupes = [...mockStore.values()].filter(
+          (v) => v === "timeout.user@example.com",
+        ).length;
+        log("Store entries for timeout.user@example.com: " + dupes);
+
+        log("\n--- Test 3: rate limit then success ---");
+        log(
+          JSON.stringify(
+            await subscribe("ratelimit.user@example.com", randomKey()),
+          ),
+        );
+
+        log("\n--- Test 4: invalid email (should not retry) ---");
+        log(JSON.stringify(await subscribe("not-an-email", randomKey())));
+
+        log(
+          "\n--- Test 5: same idempotency key twice (should not duplicate) ---",
+        );
+        const key5 = randomKey();
+        log(
+          "First: " + JSON.stringify(await subscribe("dup@example.com", key5)),
+        );
+        log(
+          "Second: " + JSON.stringify(await subscribe("dup@example.com", key5)),
+        );
+        const dupes5 = [...mockStore.values()].filter(
+          (v) => v === "dup@example.com",
+        ).length;
+        log("Store entries for dup@example.com: " + dupes5);
+
+        log("\nDone.");
+      }
+
+      run().catch((e) => log("Test failed: " + e.message));
+    </script>
+  </body>
+</html>
