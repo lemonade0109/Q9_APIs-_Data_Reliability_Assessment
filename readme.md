@@ -1,9 +1,5 @@
 # BCM Assessment Q9
 
-**Files:**
-subscriber.html — the subscribe function and browser-based test runner
-q9_test.png — test output
-
 **How to run:** open q9/subscribe.html in any browser. Tests run automatically on load. Node is not installed locally, so this runs in the browser instead of on the command line.
 
 ## The problem
